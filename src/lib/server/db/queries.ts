@@ -1,57 +1,36 @@
 import { genSaltSync, hashSync } from 'bcrypt-ts';
-import { and, asc, desc, eq, gt, gte, inArray } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
-import { POSTGRES_URL } from '$env/static/private';
-import { ResultAsync, fromPromise, ok, safeTry } from 'neverthrow';
-import {
-	user,
-	chat,
-	type User,
-	document,
-	type Suggestion,
-	suggestion,
-	type Message,
-	message,
-	vote,
-	type Session,
-	session,
-	type AuthUser,
-	type Chat,
-	type Vote
-} from './schema';
+import { ResultAsync, ok, safeTry } from 'neverthrow';
 import type { DbError } from '$lib/errors/db';
 import { DbInternalError } from '$lib/errors/db';
+import type { User, Chat, Message, Session, AuthUser, Vote, Suggestion } from './schema';
 import ms from 'ms';
-import { unwrapSingleQueryResult } from './utils';
 
-// Optionally, if not using email/pass login, you can
-// use the Drizzle adapter for Auth.js / NextAuth
-// https://authjs.dev/reference/adapter/drizzle
-
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(POSTGRES_URL);
-const db = drizzle(client);
+// In-memory storage
+const users = new Map<string, AuthUser>();
+const chats = new Map<string, Chat>();
+const messages = new Map<string, Message[]>();
+const sessions = new Map<string, Session>();
+const votes = new Map<string, Vote[]>();
+const suggestions = new Map<string, Suggestion[]>();
 
 export function getAuthUser(email: string): ResultAsync<AuthUser, DbError> {
 	return safeTry(async function* () {
-		const userResult = yield* fromPromise(
-			db.select().from(user).where(eq(user.email, email)),
-			(e) => new DbInternalError({ cause: e })
-		);
-		return unwrapSingleQueryResult(userResult, email, 'User');
+		const user = users.get(email);
+		if (!user) {
+			throw new DbInternalError({ cause: new Error('User not found') });
+		}
+		return user;
 	});
 }
 
 export function getUser(email: string): ResultAsync<User, DbError> {
 	return safeTry(async function* () {
-		const userResult = yield* fromPromise(
-			db.select().from(user).where(eq(user.email, email)),
-			(e) => new DbInternalError({ cause: e })
-		);
-		const { password: _, ...rest } = yield* unwrapSingleQueryResult(userResult, email, 'User');
-
-		return ok(rest);
+		const user = users.get(email);
+		if (!user) {
+			throw new DbInternalError({ cause: new Error('User not found') });
+		}
+		const { password: _, ...rest } = user;
+		return rest;
 	});
 }
 
@@ -59,371 +38,208 @@ export function createAuthUser(email: string, password: string): ResultAsync<Aut
 	return safeTry(async function* () {
 		const salt = genSaltSync(10);
 		const hash = hashSync(password, salt);
-
-		const userResult = yield* fromPromise(
-			db.insert(user).values({ email, password: hash }).returning(),
-			(e) => {
-				console.error(e);
-				return new DbInternalError({ cause: e });
-			}
-		);
-
-		return unwrapSingleQueryResult(userResult, email, 'User');
+		const user: AuthUser = {
+			id: crypto.randomUUID(),
+			email,
+			password: hash
+		};
+		users.set(email, user);
+		return user;
 	});
 }
 
 export function createSession(value: Session): ResultAsync<Session, DbError> {
 	return safeTry(async function* () {
-		const sessionResult = yield* fromPromise(
-			db.insert(session).values(value).returning(),
-			(e) => new DbInternalError({ cause: e })
-		);
-		return unwrapSingleQueryResult(sessionResult, value.id, 'Session');
+		sessions.set(value.id, value);
+		return value;
 	});
 }
 
-export function getFullSession(
-	sessionId: string
-): ResultAsync<{ session: Session; user: User }, DbError> {
+export function getFullSession(sessionId: string): ResultAsync<{ session: Session; user: User }, DbError> {
 	return safeTry(async function* () {
-		const sessionResult = yield* fromPromise(
-			db
-				.select({ user: { id: user.id, email: user.email }, session })
-				.from(session)
-				.innerJoin(user, eq(session.userId, user.id))
-				.where(eq(session.id, sessionId)),
-			(e) => new DbInternalError({ cause: e })
-		);
-		return unwrapSingleQueryResult(sessionResult, sessionId, 'Session');
+		const session = sessions.get(sessionId);
+		if (!session) {
+			throw new DbInternalError({ cause: new Error('Session not found') });
+		}
+		const user = users.get(session.userId);
+		if (!user) {
+			throw new DbInternalError({ cause: new Error('User not found') });
+		}
+		const { password: _, ...userWithoutPassword } = user;
+		return { session, user: userWithoutPassword };
 	});
 }
 
 export function deleteSession(sessionId: string): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		yield* fromPromise(
-			db.delete(session).where(eq(session.id, sessionId)),
-			(e) => new DbInternalError({ cause: e })
-		);
-
+		sessions.delete(sessionId);
 		return ok(undefined);
 	});
 }
 
 export function extendSession(sessionId: string): ResultAsync<Session, DbError> {
 	return safeTry(async function* () {
-		const sessionResult = yield* fromPromise(
-			db
-				.update(session)
-				.set({ expiresAt: new Date(Date.now() + ms('30d')) })
-				.where(eq(session.id, sessionId))
-				.returning(),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return unwrapSingleQueryResult(sessionResult, sessionId, 'Session');
+		const session = sessions.get(sessionId);
+		if (!session) {
+			throw new DbInternalError({ cause: new Error('Session not found') });
+		}
+		session.expiresAt = new Date(Date.now() + ms('30d'));
+		sessions.set(sessionId, session);
+		return session;
 	});
 }
 
 export function deleteSessionsForUser(userId: string): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		yield* fromPromise(
-			db.delete(session).where(eq(session.userId, userId)),
-			(e) => new DbInternalError({ cause: e })
-		);
-
+		for (const [id, session] of sessions.entries()) {
+			if (session.userId === userId) {
+				sessions.delete(id);
+			}
+		}
 		return ok(undefined);
 	});
 }
 
-export function saveChat({
-	id,
-	userId,
-	title
-}: {
-	id: string;
-	userId: string;
-	title: string;
-}): ResultAsync<Chat, DbError> {
+export function saveChat({ id, userId, title }: { id: string; userId: string; title: string }): ResultAsync<Chat, DbError> {
 	return safeTry(async function* () {
-		const insertResult = yield* fromPromise(
-			db
-				.insert(chat)
-				.values({
-					id,
-					createdAt: new Date(),
-					userId,
-					title
-				})
-				.returning(),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return unwrapSingleQueryResult(insertResult, id, 'Chat');
+		const chat: Chat = {
+			id,
+			userId,
+			title,
+			createdAt: new Date(),
+			visibility: 'private'
+		};
+		chats.set(id, chat);
+		return chat;
 	});
 }
 
 export function deleteChatById({ id }: { id: string }): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		const actions = [
-			() => db.delete(vote).where(eq(vote.chatId, id)),
-			() => db.delete(message).where(eq(message.chatId, id)),
-			() => db.delete(chat).where(eq(chat.id, id))
-		];
-
-		for (const action of actions) {
-			yield* fromPromise(action(), (e) => new DbInternalError({ cause: e }));
-		}
-
+		chats.delete(id);
+		messages.delete(id);
+		votes.delete(id);
 		return ok(undefined);
 	});
 }
 
 export function getChatsByUserId({ id }: { id: string }): ResultAsync<Chat[], DbError> {
-	return fromPromise(
-		db.select().from(chat).where(eq(chat.userId, id)).orderBy(desc(chat.createdAt)),
-		(e) => new DbInternalError({ cause: e })
-	);
+	return safeTry(async function* () {
+		return Array.from(chats.values()).filter(chat => chat.userId === id);
+	});
 }
 
 export function getChatById({ id }: { id: string }): ResultAsync<Chat, DbError> {
 	return safeTry(async function* () {
-		const chatResult = yield* fromPromise(
-			db.select().from(chat).where(eq(chat.id, id)),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return unwrapSingleQueryResult(chatResult, id, 'Chat');
+		const chat = chats.get(id);
+		if (!chat) {
+			throw new DbInternalError({ cause: new Error('Chat not found') });
+		}
+		return chat;
 	});
 }
 
-export function saveMessages({
-	messages
-}: {
-	messages: Array<Message>;
-}): ResultAsync<Message[], DbError> {
+export function saveMessages({ messages: newMessages }: { messages: Message[] }): ResultAsync<void, DbError> {
 	return safeTry(async function* () {
-		const insertResult = yield* fromPromise(
-			db.insert(message).values(messages).returning(),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return ok(insertResult);
+		for (const message of newMessages) {
+			const chatMessages = messages.get(message.chatId) || [];
+			chatMessages.push(message);
+			messages.set(message.chatId, chatMessages);
+		}
 	});
 }
 
 export function getMessagesByChatId({ id }: { id: string }): ResultAsync<Message[], DbError> {
 	return safeTry(async function* () {
-		const messages = yield* fromPromise(
-			db.select().from(message).where(eq(message.chatId, id)).orderBy(asc(message.createdAt)),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return ok(messages);
+		return messages.get(id) || [];
 	});
 }
 
-export function voteMessage({
-	chatId,
-	messageId,
-	type
-}: {
-	chatId: string;
-	messageId: string;
-	type: 'up' | 'down';
-}): ResultAsync<undefined, DbError> {
+export function voteMessage({ chatId, messageId, type }: { chatId: string; messageId: string; type: 'up' | 'down' }): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		yield* fromPromise(
-			db
-				.insert(vote)
-				.values({
-					chatId,
-					messageId,
-					isUpvoted: type === 'up'
-				})
-				.onConflictDoUpdate({
-					target: [vote.messageId, vote.chatId],
-					set: { isUpvoted: type === 'up' }
-				}),
-			(e) => new DbInternalError({ cause: e })
-		);
+		const chatVotes = votes.get(chatId) || [];
+		const existingVoteIndex = chatVotes.findIndex(v => v.messageId === messageId);
+		if (existingVoteIndex >= 0) {
+			chatVotes[existingVoteIndex].value = type === 'up' ? 1 : -1;
+		} else {
+			chatVotes.push({
+				id: crypto.randomUUID(),
+				chatId,
+				messageId,
+				userId: '', // TODO: Add user ID when implementing user authentication
+				value: type === 'up' ? 1 : -1,
+				createdAt: new Date()
+			});
+		}
+		votes.set(chatId, chatVotes);
 		return ok(undefined);
 	});
 }
 
 export function getVotesByChatId({ id }: { id: string }): ResultAsync<Vote[], DbError> {
-	return fromPromise(
-		db.select().from(vote).where(eq(vote.chatId, id)),
-		(e) => new DbInternalError({ cause: e })
-	);
+	return safeTry(async function* () {
+		return votes.get(id) || [];
+	});
 }
 
-export async function saveDocument({
-	id,
-	title,
-	kind,
-	content,
-	userId
-}: {
-	id: string;
-	title: string;
-	kind: never;
-	content: string;
-	userId: string;
-}) {
-	try {
-		return await db.insert(document).values({
-			id,
-			title,
-			kind,
-			content,
-			userId,
-			createdAt: new Date()
-		});
-	} catch (error) {
-		console.error('Failed to save document in database');
-		throw error;
-	}
+export function saveSuggestions({ suggestions: newSuggestions }: { suggestions: Suggestion[] }): ResultAsync<Suggestion[], DbError> {
+	return safeTry(async function* () {
+		for (const suggestion of newSuggestions) {
+			const docSuggestions = suggestions.get(suggestion.documentId) || [];
+			docSuggestions.push(suggestion);
+			suggestions.set(suggestion.documentId, docSuggestions);
+		}
+		return newSuggestions;
+	});
 }
 
-export async function getDocumentsById({ id }: { id: string }) {
-	try {
-		const documents = await db
-			.select()
-			.from(document)
-			.where(eq(document.id, id))
-			.orderBy(asc(document.createdAt));
-
-		return documents;
-	} catch (error) {
-		console.error('Failed to get document by id from database');
-		throw error;
-	}
-}
-
-export async function getDocumentById({ id }: { id: string }) {
-	try {
-		const [selectedDocument] = await db
-			.select()
-			.from(document)
-			.where(eq(document.id, id))
-			.orderBy(desc(document.createdAt));
-
-		return selectedDocument;
-	} catch (error) {
-		console.error('Failed to get document by id from database');
-		throw error;
-	}
-}
-
-export async function deleteDocumentsByIdAfterTimestamp({
-	id,
-	timestamp
-}: {
-	id: string;
-	timestamp: Date;
-}) {
-	try {
-		await db
-			.delete(suggestion)
-			.where(and(eq(suggestion.documentId, id), gt(suggestion.documentCreatedAt, timestamp)));
-
-		return await db
-			.delete(document)
-			.where(and(eq(document.id, id), gt(document.createdAt, timestamp)));
-	} catch (error) {
-		console.error('Failed to delete documents by id after timestamp from database');
-		throw error;
-	}
-}
-
-export function saveSuggestions({
-	suggestions
-}: {
-	suggestions: Array<Suggestion>;
-}): ResultAsync<Suggestion[], DbError> {
-	return fromPromise(
-		db.insert(suggestion).values(suggestions).returning(),
-		(e) => new DbInternalError({ cause: e })
-	);
-}
-
-export function getSuggestionsByDocumentId({
-	documentId
-}: {
-	documentId: string;
-}): ResultAsync<Suggestion[], DbError> {
-	return fromPromise(
-		db.select().from(suggestion).where(eq(suggestion.documentId, documentId)),
-		(e) => new DbInternalError({ cause: e })
-	);
+export function getSuggestionsByDocumentId({ documentId }: { documentId: string }): ResultAsync<Suggestion[], DbError> {
+	return safeTry(async function* () {
+		return suggestions.get(documentId) || [];
+	});
 }
 
 export function getMessageById({ id }: { id: string }): ResultAsync<Message, DbError> {
 	return safeTry(async function* () {
-		const messageResult = yield* fromPromise(
-			db.select().from(message).where(eq(message.id, id)),
-			(e) => new DbInternalError({ cause: e })
-		);
-
-		return unwrapSingleQueryResult(messageResult, id, 'Message');
+		for (const chatMessages of messages.values()) {
+			const message = chatMessages.find(m => m.id === id);
+			if (message) {
+				return message;
+			}
+		}
+		throw new DbInternalError({ cause: new Error('Message not found') });
 	});
 }
 
-export function deleteMessagesByChatIdAfterTimestamp({
-	chatId,
-	timestamp
-}: {
-	chatId: string;
-	timestamp: Date;
-}): ResultAsync<undefined, DbError> {
+export function deleteMessagesByChatIdAfterTimestamp({ chatId, timestamp }: { chatId: string; timestamp: Date }): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		const messagesToDelete = yield* fromPromise(
-			db
-				.select({ id: message.id })
-				.from(message)
-				.where(and(eq(message.chatId, chatId), gte(message.createdAt, timestamp))),
-			(e) => new DbInternalError({ cause: e })
-		);
-		const messageIds = messagesToDelete.map((message) => message.id);
-		if (messageIds.length > 0) {
-			const votes = fromPromise(
-				db.delete(vote).where(and(eq(vote.chatId, chatId), inArray(vote.messageId, messageIds))),
-				(e) => new DbInternalError({ cause: e })
-			);
-			const messages = fromPromise(
-				db.delete(message).where(and(eq(message.chatId, chatId), inArray(message.id, messageIds))),
-				(e) => new DbInternalError({ cause: e })
-			);
-			yield* votes;
-			yield* messages;
-		}
+		const chatMessages = messages.get(chatId) || [];
+		const filteredMessages = chatMessages.filter(m => m.createdAt < timestamp);
+		messages.set(chatId, filteredMessages);
 		return ok(undefined);
 	});
 }
 
 export function deleteTrailingMessages({ id }: { id: string }): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		const message = yield* getMessageById({ id });
-		yield* deleteMessagesByChatIdAfterTimestamp({
-			chatId: message.chatId,
-			timestamp: message.createdAt
-		});
+		const chatMessages = messages.get(id) || [];
+		const lastUserMessageIndex = [...chatMessages].reverse().findIndex(m => m.role === 'user');
+		if (lastUserMessageIndex >= 0) {
+			const cutoffIndex = chatMessages.length - lastUserMessageIndex;
+			messages.set(id, chatMessages.slice(0, cutoffIndex));
+		}
 		return ok(undefined);
 	});
 }
 
-export function updateChatVisiblityById({
-	chatId,
-	visibility
-}: {
-	chatId: string;
-	visibility: 'private' | 'public';
-}): ResultAsync<undefined, DbError> {
+export function updateChatVisiblityById({ chatId, visibility }: { chatId: string; visibility: 'private' | 'public' }): ResultAsync<undefined, DbError> {
 	return safeTry(async function* () {
-		yield* fromPromise(
-			db.update(chat).set({ visibility }).where(eq(chat.id, chatId)),
-			(e) => new DbInternalError({ cause: e })
-		);
+		const chat = chats.get(chatId);
+		if (!chat) {
+			throw new DbInternalError({ cause: new Error('Chat not found') });
+		}
+		chat.visibility = visibility;
+		chats.set(chatId, chat);
 		return ok(undefined);
 	});
 }
